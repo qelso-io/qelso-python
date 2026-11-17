@@ -1,0 +1,1957 @@
+openapi: 3.1.0
+info:
+  title: Qelso Data API
+  version: 2.0.0
+  summary: Historical prediction-market data from Kalshi and Polymarket, from daily bars to individual order-book changes.
+  description: |
+    The Qelso Data API serves historical data from prediction-market venues through one set of endpoints:
+    market discovery, minute and sub-minute prices, the order book at any millisecond, best bid/ask
+    and book changes, and trades.
+
+    ## Authentication
+    - Send your API key in the `X-API-Key` header on every request (`GET /v2/health` needs none).
+    - Existing API keys work here.
+    - Your plan and add-ons decide which venues and data you can read. `GET /v2/usage` shows them.
+
+    ## Venues and IDs
+    - Every market, event and series has an ID made of the venue and the venue's own ID, separated by a colon. Examples:
+      - market `kalshi:KXFEDDECISION-26OCT-H0` or `polymarket:560868`;
+      - event `kalshi:KXFEDDECISION-26OCT`;
+      - series `kalshi:KXFEDDECISION`.
+    - For Polymarket, the part after the colon may also be the slug. Responses always return the numeric form.
+    - Kalshi tickers are case-insensitive.
+    - Responses also carry the venue's own IDs: `native_id` everywhere, and `native` in market details.
+    - `GET /v2/venues` lists the venues, the datasets each one provides, and from when.
+    - Combo (multivariate) markets are not covered.
+
+    ## One market, one book: the YES side
+    - Every market has two outcomes, YES and NO, and one order book: the **YES book**, bids and asks, best first.
+      - On Kalshi, a NO bid at p is a YES ask at 1 − p.
+      - Polymarket's two tokens mirror each other, so the YES token's book is the market's whole book. Never add the two together.
+    - **`outcome=no`** returns the NO view on every price endpoint: prices become 1 − p, and bids and asks swap.
+    - Many Polymarket markets have outcomes other than "Yes" and "No": two teams, "Over"/"Under", "Up"/"Down". On those, YES is the venue's first-listed outcome and NO the second. Every market object, and the `market` object of every history response, gives both labels in `outcomes`, e.g. `{"yes": {"label": "Browns"}, "no": {"label": "Steelers"}}`.
+    - Scalar markets (`market_type: scalar`) settle at any value from 0 to 1 (`settlement_value`).
+
+    ## Time
+    - **Inputs** take three forms:
+      - RFC 3339 (`2026-10-18T14:00:00Z`). Offsets are allowed; no offset means UTC.
+      - A date (`2026-10-18`), meaning midnight UTC.
+      - Epoch **milliseconds**.
+
+      Digits beyond milliseconds are dropped.
+    - **Windows** are `[start, end)`: `start` is included, `end` is not. An `end` later than now is treated as now.
+    - **Outputs** are RFC 3339 UTC with milliseconds (`2026-10-18T14:00:00.000Z`).
+    - **Grid rows** (prices, candles, stats, sampled books) each cover one interval `[t, t + resolution)` on the UTC grid:
+      - 1m on the minute; 1h on the hour; 6h at 00, 06, 12 and 18; 1d at midnight;
+      - 1s and 100ms on whole seconds and tenths.
+
+      `t` is the interval's start. Prices, books and the state fields of stats are as of the interval's **end** (its close), so every grid endpoint lines up on `t`. Only whole intervals inside the window are returned.
+
+      A row has `carried: true` when nothing changed in its interval, so its values repeat the previous row's. Where there is no data at an interval's end, its values are null.
+    - **Event rows** (best bid/ask changes, book changes, trades) carry:
+      - `ts`: the venue's time, in milliseconds;
+      - `seq`: orders a market's rows that share the same `ts`, from 1. `(ts, seq)` is a row's position in the market; don't compare it across markets.
+
+    ## Prices and sizes
+    - Prices are numbers from 0 to 1 (dollars per $1 contract, the implied probability), with up to 6 decimals, on every venue.
+    - Sizes are in contracts (Kalshi) or shares (Polymarket), with up to 6 decimals.
+    - `mid` = (bid + ask) / 2. An empty bid counts as 0 and an empty ask as 1. It is null when both sides are empty.
+
+    ## Pagination
+    - Lists and history pages return `next_cursor`. Pass it back as `cursor`, with the same parameters, until it is null.
+    - Cursors are opaque, tied to the request that produced them, and valid for 24 hours.
+    - On history endpoints, a paging run serves the data available when its first page was served, so its pages never skip or repeat a row, unless the data is corrected while you page. Data that arrives later appears when you request again.
+
+    ## Streams
+    - History endpoints also stream. Send one of:
+      - `Accept: application/x-ndjson`: one JSON row per line, the same objects as in `data`;
+      - `Accept: text/csv`: a header row first.
+
+      Books stream as NDJSON only. Discovery and lifecycle don't stream.
+    - Streams carry rows only. For Kalshi data, the attribution and data type come in the `Qelso-Attribution` and `Qelso-Data-Type` response headers.
+    - A stream that ends normally has delivered every row we hold for the window.
+    - If anything fails after the first byte, we close the connection without finishing the response, so your HTTP client raises an error. Resume with `after=` set to the last row's key (each endpoint gives the fields).
+    - Send `Accept-Encoding: gzip` for large streams.
+
+    ## Limits
+    Rate limits are counted in **units per minute per organisation**. Each response's `Qelso-Units` header gives its cost; `X-RateLimit-Limit`, `X-RateLimit-Remaining` and `X-RateLimit-Reset` give your budget.
+
+    | Class | Endpoints | Page size | Window per request | Units |
+    |---|---|---|---|---|
+    | Reference | venues, categories, series, events, markets, market, lifecycle, usage | ≤ 1,000 items (default 100) | — | 1 |
+    | Minute | prices, candles and stats at 1m–1d; books at intervals of 1m–1d | ≤ 1,000 points | no limit (your plan's history window applies) | 1 |
+    | Sub-minute | prices and candles at 1s and 100ms; books `at` a millisecond or at intervals below 1m | ≤ 10,000 points (books ≤ 1,000) | ≤ 6 h; books also ≤ 100,000 intervals | 5 |
+    | Ticks | bbo, book-updates | ≤ 10,000 rows | ≤ 6 h | 10 |
+    | Ticks | trades | ≤ 10,000 rows | ≤ 31 days | 10 |
+    | Streams | prices, candles, stats, books, bbo, book-updates, trades with `Accept: application/x-ndjson` or `text/csv` | — | ≤ 24 h (sub-minute, bbo, book-updates; books below 1m also ≤ 100,000 intervals); ≤ 31 days (trades); ≤ 366 days (1m–1d) | the endpoint's page cost |
+
+    - Book pages also stop at 100,000 price levels.
+    - Requests rejected with 400, 403, 404 or 406 cost 1 unit. `GET /v2/health` is free.
+    - Each organisation may run at most **2 streams** and **4 sub-minute or tick requests** at once.
+    - Tick rows (pages and streams) count against monthly quotas, shown by `GET /v2/usage`.
+    - A stream won't start when its quota is used up. Once started, a stream is never cut off for rate or quota, so it may finish slightly over.
+
+    ## Errors
+    Errors share one shape: `{"error": {"code": "...", "message": "...", "request_id": "...", "details": {...}}}`. The `code` values are stable:
+
+    | HTTP | `code` | Meaning |
+    |---|---|---|
+    | 400 | `invalid_parameter` | A parameter is missing, malformed or out of range (`details.parameter`) |
+    | 400 | `invalid_cursor` | The cursor is malformed or expired, or was sent with different parameters |
+    | 400 | `window_too_large` | The window or number of intervals is over this endpoint's limit (`details.max`) |
+    | 401 | `unauthorized` | The key is missing, invalid, revoked or expired |
+    | 403 | `forbidden_venue` | No access to this venue (`details.reason`: `not_in_plan`, `eligibility_required` or `not_yet_available`) |
+    | 403 | `forbidden_dataset` | This data isn't available to you on this venue (`details.reason`: `not_in_plan`, or `not_offered` when we don't offer it on that venue) |
+    | 403 | `plan_history_limit` | `start` is earlier than your plan allows (`details.earliest_allowed`) |
+    | 403 | `plan_resolution_not_allowed` | The resolution or interval is finer than your plan allows (`details.min_resolution`) |
+    | 403 | `suspended` | Your organisation's access to this venue is suspended |
+    | 404 | `not_found` | Unknown market, event, series or path |
+    | 406 | `not_acceptable` | This endpoint can't return the format asked for in `Accept` |
+    | 429 | `rate_limited` | Over your units per minute or your concurrent requests; wait `Retry-After` seconds |
+    | 429 | `quota_exceeded` | A monthly quota is used up (`details.resets_at`); don't retry automatically |
+    | 500 | `internal_error` | Our fault; retry with backoff and quote `request_id` |
+    | 503 | `metadata_refreshing` | Market metadata is being refreshed; retry after `Retry-After` seconds |
+    | 503 | `service_unavailable` | Temporarily unavailable; retry after `Retry-After` seconds |
+    | 504 | `timeout` | The query ran over its time limit; narrow the window, or use a stream |
+
+    ## Kalshi data
+    - Every response and stream that contains Kalshi data carries `"attribution": "Powered by Kalshi Research"` and a `data_type`:
+      - `historical`: all of the data is at least 24 hours old;
+      - `delayed`: some of it is newer.
+    - Show the attribution wherever you display Kalshi data.
+    - Kalshi data is available to eligible organisations whose plan includes it.
+
+    ## Coming from v1
+    - IDs carry the venue: `polymarket:560868` or `polymarket:<slug>`.
+    - Tokens are gone. There is one YES book per market; use `outcome=no` for the NO side.
+    - Prices at 10m, 1h, 6h and 1d are interval closes, not averages. Sampled books are as of each interval's end, not its start, so they line up with prices.
+    - Errors have stable codes. Limits are counted in units, not requests.
+
+    ## Versioning
+    - v2 changes only by addition: new endpoints, parameters, fields and enum values (venues, datasets, entitlements, lifecycle types, error codes) may appear. Treat unknown values as "other".
+    - Anything that would break a client goes into a new version, with notice.
+servers:
+  - url: https://api.qelso.io
+    description: Production
+security:
+  - ApiKeyAuth: []
+tags:
+  - name: Reference
+    description: Venues, categories and what's available.
+  - name: Discovery
+    description: Series, events and markets on every venue.
+  - name: History
+    description: Prices, candles, statistics and order books, from daily to 100-millisecond intervals.
+  - name: Ticks
+    description: Best bid/ask changes, order-book changes and trades.
+  - name: Account
+    description: Usage, limits and health.
+
+paths:
+  /v2/health:
+    get:
+      tags: [Account]
+      operationId: getHealth
+      summary: Health
+      description: |
+        Whether the API can serve requests. Needs no key and costs nothing. Returns 503 when it can't.
+      security: []
+      responses:
+        '200':
+          description: Serving.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/HealthResponse'}
+              example: {status: ok, version: 2.0.0, time: '2026-10-18T14:00:00.000Z'}
+        '503':
+          description: Not serving.
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/HealthResponse'}
+              example: {status: unavailable, version: 2.0.0, time: '2026-10-18T14:00:00.000Z'}
+
+  /v2/usage:
+    get:
+      tags: [Account]
+      operationId: getUsage
+      summary: Usage, entitlements and quotas
+      description: |
+        Your organisation's plan, rate limit, access per venue and dataset, and monthly quotas with what's used so far.
+
+        **Access:** any key. **Cost:** 1 unit.
+      responses:
+        '200':
+          description: Usage.
+          headers:
+            X-Request-ID: {$ref: '#/components/headers/X-Request-ID'}
+            X-RateLimit-Limit: {$ref: '#/components/headers/X-RateLimit-Limit'}
+            X-RateLimit-Remaining: {$ref: '#/components/headers/X-RateLimit-Remaining'}
+            X-RateLimit-Reset: {$ref: '#/components/headers/X-RateLimit-Reset'}
+            Qelso-Units: {$ref: '#/components/headers/Qelso-Units'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/UsageResponse'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '406': {$ref: '#/components/responses/NotAcceptable'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+
+  /v2/venues:
+    get:
+      tags: [Reference]
+      operationId: listVenues
+      summary: Venues and their datasets
+      description: |
+        Every venue, the datasets it provides, from when each one is available, and the attribution its data must carry.
+
+        **Access:** any key. **Cost:** 1 unit.
+      responses:
+        '200':
+          description: Venues.
+          headers:
+            X-Request-ID: {$ref: '#/components/headers/X-Request-ID'}
+            X-RateLimit-Limit: {$ref: '#/components/headers/X-RateLimit-Limit'}
+            X-RateLimit-Remaining: {$ref: '#/components/headers/X-RateLimit-Remaining'}
+            X-RateLimit-Reset: {$ref: '#/components/headers/X-RateLimit-Reset'}
+            Qelso-Units: {$ref: '#/components/headers/Qelso-Units'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/VenueList'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '406': {$ref: '#/components/responses/NotAcceptable'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+
+  /v2/categories:
+    get:
+      tags: [Reference]
+      operationId: listCategories
+      summary: Categories
+      description: |
+        Our category taxonomy, used by the `category` filter on every venue, and the venue categories each one includes.
+
+        **Access:** any key. **Cost:** 1 unit.
+      responses:
+        '200':
+          description: Categories.
+          headers:
+            X-Request-ID: {$ref: '#/components/headers/X-Request-ID'}
+            X-RateLimit-Limit: {$ref: '#/components/headers/X-RateLimit-Limit'}
+            X-RateLimit-Remaining: {$ref: '#/components/headers/X-RateLimit-Remaining'}
+            X-RateLimit-Reset: {$ref: '#/components/headers/X-RateLimit-Reset'}
+            Qelso-Units: {$ref: '#/components/headers/Qelso-Units'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CategoryList'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '406': {$ref: '#/components/responses/NotAcceptable'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+
+  /v2/series:
+    get:
+      tags: [Discovery]
+      operationId: listSeries
+      summary: List series
+      description: |
+        Series (recurring groups of events, such as a monthly Fed decision) on the venues you can access.
+
+        Without `venue`, the list covers every venue your key can read.
+
+        **Access:** `reference` for each venue listed. **Cost:** 1 unit per page.
+      parameters:
+        - $ref: '#/components/parameters/VenueFilter'
+        - $ref: '#/components/parameters/CategoryFilter'
+        - $ref: '#/components/parameters/Search'
+        - $ref: '#/components/parameters/Ids'
+        - $ref: '#/components/parameters/UpdatedSince'
+        - name: sort
+          in: query
+          description: Sort field. With `search`, results are sorted by relevance instead.
+          schema: {type: string, enum: [updated_at, created_at], default: updated_at}
+        - $ref: '#/components/parameters/Order'
+        - $ref: '#/components/parameters/DiscoveryLimit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: A page of series.
+          headers:
+            X-Request-ID: {$ref: '#/components/headers/X-Request-ID'}
+            X-RateLimit-Limit: {$ref: '#/components/headers/X-RateLimit-Limit'}
+            X-RateLimit-Remaining: {$ref: '#/components/headers/X-RateLimit-Remaining'}
+            X-RateLimit-Reset: {$ref: '#/components/headers/X-RateLimit-Reset'}
+            Qelso-Units: {$ref: '#/components/headers/Qelso-Units'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/SeriesList'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '406': {$ref: '#/components/responses/NotAcceptable'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '504': {$ref: '#/components/responses/Timeout'}
+
+  /v2/events:
+    get:
+      tags: [Discovery]
+      operationId: listEvents
+      summary: List events
+      description: |
+        Events (one question with one or more markets, such as a Fed decision with one market per outcome) on the venues you can access.
+
+        - `status` matches an event if **any** of its markets has that status.
+        - The time filters use the event's `start_time` (its earliest market open) and `end_time` (its latest market close).
+
+        **Access:** `reference` for each venue listed. **Cost:** 1 unit per page.
+      parameters:
+        - $ref: '#/components/parameters/VenueFilter'
+        - $ref: '#/components/parameters/CategoryFilter'
+        - $ref: '#/components/parameters/StatusFilter'
+        - $ref: '#/components/parameters/SeriesFilter'
+        - $ref: '#/components/parameters/Search'
+        - $ref: '#/components/parameters/Ids'
+        - {$ref: '#/components/parameters/OpenFrom', description: 'Events whose earliest market opens at or after this time.'}
+        - {$ref: '#/components/parameters/OpenTo', description: 'Events whose earliest market opens before this time.'}
+        - {$ref: '#/components/parameters/CloseFrom', description: 'Events whose latest market closes at or after this time.'}
+        - {$ref: '#/components/parameters/CloseTo', description: 'Events whose latest market closes before this time.'}
+        - $ref: '#/components/parameters/UpdatedSince'
+        - name: sort
+          in: query
+          description: Sort field. With `search`, results are sorted by relevance instead.
+          schema: {type: string, enum: [updated_at, created_at, start_time, end_time], default: updated_at}
+        - $ref: '#/components/parameters/Order'
+        - $ref: '#/components/parameters/DiscoveryLimit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: A page of events.
+          headers:
+            X-Request-ID: {$ref: '#/components/headers/X-Request-ID'}
+            X-RateLimit-Limit: {$ref: '#/components/headers/X-RateLimit-Limit'}
+            X-RateLimit-Remaining: {$ref: '#/components/headers/X-RateLimit-Remaining'}
+            X-RateLimit-Reset: {$ref: '#/components/headers/X-RateLimit-Reset'}
+            Qelso-Units: {$ref: '#/components/headers/Qelso-Units'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/EventList'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '406': {$ref: '#/components/responses/NotAcceptable'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '504': {$ref: '#/components/responses/Timeout'}
+
+  /v2/markets:
+    get:
+      tags: [Discovery]
+      operationId: listMarkets
+      summary: List markets
+      description: |
+        Markets on the venues you can access.
+
+        - To sync a local copy, use `updated_since` with `sort=updated_at&order=asc`.
+        - To look up known markets, use `ids` (up to 100).
+
+        **Access:** `reference` for each venue listed. **Cost:** 1 unit per page.
+      parameters:
+        - $ref: '#/components/parameters/VenueFilter'
+        - $ref: '#/components/parameters/CategoryFilter'
+        - $ref: '#/components/parameters/StatusFilter'
+        - $ref: '#/components/parameters/SeriesFilter'
+        - $ref: '#/components/parameters/EventFilter'
+        - $ref: '#/components/parameters/Search'
+        - $ref: '#/components/parameters/Ids'
+        - $ref: '#/components/parameters/OpenFrom'
+        - $ref: '#/components/parameters/OpenTo'
+        - $ref: '#/components/parameters/CloseFrom'
+        - $ref: '#/components/parameters/CloseTo'
+        - $ref: '#/components/parameters/UpdatedSince'
+        - name: sort
+          in: query
+          description: Sort field. With `search`, results are sorted by relevance instead.
+          schema: {type: string, enum: [updated_at, created_at, open_time, close_time], default: updated_at}
+        - $ref: '#/components/parameters/Order'
+        - $ref: '#/components/parameters/DiscoveryLimit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: A page of markets.
+          headers:
+            X-Request-ID: {$ref: '#/components/headers/X-Request-ID'}
+            X-RateLimit-Limit: {$ref: '#/components/headers/X-RateLimit-Limit'}
+            X-RateLimit-Remaining: {$ref: '#/components/headers/X-RateLimit-Remaining'}
+            X-RateLimit-Reset: {$ref: '#/components/headers/X-RateLimit-Reset'}
+            Qelso-Units: {$ref: '#/components/headers/Qelso-Units'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MarketList'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '406': {$ref: '#/components/responses/NotAcceptable'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '504': {$ref: '#/components/responses/Timeout'}
+
+  /v2/markets/{market_id}:
+    get:
+      tags: [Discovery]
+      operationId: getMarket
+      summary: Market details
+      description: |
+        Everything we hold about one market: rules, outcome labels, tick structure, times, settlement, the venue's own IDs and venue-specific fields.
+
+        With `as_of`, you get the metadata as it was at that time (Kalshi only for now; on Polymarket it returns `invalid_parameter`):
+        - Metadata history is available from 17 October 2026.
+        - If `as_of` is before the market's first available version (always the case before 17 October 2026), you get that first version, so the details at `as_of` may have been different.
+
+        **Access:** `reference` for the venue. **Cost:** 1 unit.
+      parameters:
+        - $ref: '#/components/parameters/MarketId'
+        - name: as_of
+          in: query
+          description: 'Kalshi only: return the metadata as it was at this time (available from 17 October 2026).'
+          schema: {$ref: '#/components/schemas/TimestampInput'}
+      responses:
+        '200':
+          description: The market.
+          headers:
+            X-Request-ID: {$ref: '#/components/headers/X-Request-ID'}
+            X-RateLimit-Limit: {$ref: '#/components/headers/X-RateLimit-Limit'}
+            X-RateLimit-Remaining: {$ref: '#/components/headers/X-RateLimit-Remaining'}
+            X-RateLimit-Reset: {$ref: '#/components/headers/X-RateLimit-Reset'}
+            Qelso-Units: {$ref: '#/components/headers/Qelso-Units'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/MarketResponse'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '406': {$ref: '#/components/responses/NotAcceptable'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+
+  /v2/markets/{market_id}/lifecycle:
+    get:
+      tags: [Discovery]
+      operationId: listMarketLifecycle
+      summary: Market lifecycle
+      description: |
+        Status changes, close-time changes, results, and edits to the rules and other metadata, in time order.
+
+        - **Kalshi:** changes from 17 October 2026. Before that, only the market's creation and final result are known.
+        - **Polymarket:** creation, close and result only.
+
+        Without `start` and `end`, you get the market's whole life.
+
+        **Access:** `reference` for the venue. **Cost:** 1 unit per page.
+      parameters:
+        - $ref: '#/components/parameters/MarketId'
+        - {$ref: '#/components/parameters/StartOptional'}
+        - {$ref: '#/components/parameters/EndOptional'}
+        - $ref: '#/components/parameters/DiscoveryLimit'
+        - $ref: '#/components/parameters/Cursor'
+      responses:
+        '200':
+          description: A page of lifecycle changes.
+          headers:
+            X-Request-ID: {$ref: '#/components/headers/X-Request-ID'}
+            X-RateLimit-Limit: {$ref: '#/components/headers/X-RateLimit-Limit'}
+            X-RateLimit-Remaining: {$ref: '#/components/headers/X-RateLimit-Remaining'}
+            X-RateLimit-Reset: {$ref: '#/components/headers/X-RateLimit-Reset'}
+            Qelso-Units: {$ref: '#/components/headers/Qelso-Units'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/LifecyclePage'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '406': {$ref: '#/components/responses/NotAcceptable'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '504': {$ref: '#/components/responses/Timeout'}
+
+  /v2/markets/{market_id}/prices:
+    get:
+      tags: [History]
+      operationId: getMarketPrices
+      summary: Prices
+      description: |
+        Bid, ask, mid and last trade for each interval, as the interval's close:
+        - `bid`, `ask` and `mid`: the state at the end of the interval;
+        - `last`: the last trade before the end;
+        - intervals with no change repeat the previous values, with `carried: true`;
+        - intervals with no data at their end have null values.
+
+        **Availability:**
+        - **Kalshi:** 1m and coarser from `bars_1m`'s `available_from` in `GET /v2/venues` (it moves earlier as history is loaded); 1s and 100ms from 17 October 2026.
+        - **Polymarket:**
+          - 1m and coarser from `bars_1m`'s `available_from` in `GET /v2/venues`, with `mid` only: `bid` and `ask` are null.
+          - `last` from `trades`' `available_from` in `GET /v2/venues`: the price of the last trade before the interval's end. A page with `last` ends where both the mid and the trades are available, which can be earlier than the mid alone: leave `last` out of `fields` for the latest mids. Without `last`, `carried` doesn't look at trades: an interval with a trade and no other change is `carried: true`.
+          - Markets that closed before `bars_1m`'s `available_from` have no mid; their `last` runs from `trades`' `available_from`, so those that closed before that have neither.
+          - 1s and 100ms from `bbo`'s `available_from` in `GET /v2/venues`, with `bid`, `ask` and `mid` from the book. A page there can hold fewer than `limit` points before the window's end, on markets whose book changes very often: keep paging until `next_cursor` is null.
+
+        **Datasets read:** `bars_1m` (1m and coarser); `bbo` and `trades` (1s, 100ms). On Polymarket, `trades` is read only for `last`, at every resolution.
+
+        **Access:** `minute`, or `subminute` for 1s and 100ms. **Cost:** 1 unit per page, or 5 at 1s and 100ms.
+
+        **Streams:** NDJSON or CSV. Resume key: `after=<t>`.
+      parameters:
+        - $ref: '#/components/parameters/MarketId'
+        - $ref: '#/components/parameters/Start'
+        - $ref: '#/components/parameters/End'
+        - $ref: '#/components/parameters/Resolution'
+        - name: fields
+          in: query
+          description: Comma-separated fields to return. Fields not asked for are left out of each row.
+          style: form
+          explode: false
+          schema:
+            type: array
+            items: {type: string, enum: [bid, ask, mid, last]}
+            minItems: 1
+            uniqueItems: true
+            default: [bid, ask, mid, last]
+        - $ref: '#/components/parameters/Outcome'
+        - $ref: '#/components/parameters/HistoryLimit'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/AfterT'
+      responses:
+        '200':
+          description: A page of price points, or a stream of them.
+          headers:
+            X-Request-ID: {$ref: '#/components/headers/X-Request-ID'}
+            X-RateLimit-Limit: {$ref: '#/components/headers/X-RateLimit-Limit'}
+            X-RateLimit-Remaining: {$ref: '#/components/headers/X-RateLimit-Remaining'}
+            X-RateLimit-Reset: {$ref: '#/components/headers/X-RateLimit-Reset'}
+            Qelso-Units: {$ref: '#/components/headers/Qelso-Units'}
+            Qelso-Attribution: {$ref: '#/components/headers/Qelso-Attribution'}
+            Qelso-Data-Type: {$ref: '#/components/headers/Qelso-Data-Type'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/PricesPage'}
+            application/x-ndjson:
+              schema: {type: string, description: One PricePoint object per line.}
+            text/csv:
+              schema: {type: string, description: 'Header row, then one PricePoint per row: t, the fields asked for, carried.'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '406': {$ref: '#/components/responses/NotAcceptable'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '504': {$ref: '#/components/responses/Timeout'}
+
+  /v2/markets/{market_id}/candles:
+    get:
+      tags: [History]
+      operationId: getMarketCandles
+      summary: Candles
+      description: |
+        Open, high, low and close for each interval, with volume, trade count and VWAP.
+
+        **`basis`:**
+        - `mid` (default): the OHLC is of the mid price;
+        - `trade`: the OHLC is of trade prices.
+
+        Volume, trades and VWAP always come from trades, and are null where the venue's trades aren't available.
+
+        **Empty intervals:** they repeat the previous close with zero volume and `carried: true`. Intervals with no data at their end are null.
+
+        **Availability:** as for prices.
+        - **Kalshi:** trade candles from `trades`' `available_from` in `GET /v2/venues`; before 16:16 UTC on 17 October 2026, mid `high` and `low` may be null. Before 18 October 2026, a trade candle's `open` and `close` follow the order of trades that share a `ts`, so they can differ from the first and last trade executed.
+        - **Polymarket:** trade candles, volume, trades and VWAP from `trades`' `available_from` in `GET /v2/venues`. Each trade is the fill of one maker order (see `trades`): a taker order that fills three resting orders counts as three trades, and volume counts each share once. Mid candles end where both the mid and the trades are available; trade candles where the trades are. Markets that closed before `bars_1m`'s `available_from` have mid candles with a null open, high, low and close; their trade candles, volume, trades and VWAP run from `trades`' `available_from`. At 1s and 100ms a page can hold fewer than `limit` candles before the window's end, as for prices.
+
+        **Datasets read:** `bars_1m`, `trades`; `bbo` at 1s and 100ms.
+
+        **Access:** `minute`, or `subminute` for 1s and 100ms. **Cost:** 1 unit per page, or 5 at 1s and 100ms.
+
+        **Streams:** NDJSON or CSV. Resume key: `after=<t>`.
+      parameters:
+        - $ref: '#/components/parameters/MarketId'
+        - $ref: '#/components/parameters/Start'
+        - $ref: '#/components/parameters/End'
+        - $ref: '#/components/parameters/Resolution'
+        - name: basis
+          in: query
+          description: Price the OHLC is built from.
+          schema: {type: string, enum: [mid, trade], default: mid}
+        - $ref: '#/components/parameters/Outcome'
+        - $ref: '#/components/parameters/HistoryLimit'
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/AfterT'
+      responses:
+        '200':
+          description: A page of candles, or a stream of them.
+          headers:
+            X-Request-ID: {$ref: '#/components/headers/X-Request-ID'}
+            X-RateLimit-Limit: {$ref: '#/components/headers/X-RateLimit-Limit'}
+            X-RateLimit-Remaining: {$ref: '#/components/headers/X-RateLimit-Remaining'}
+            X-RateLimit-Reset: {$ref: '#/components/headers/X-RateLimit-Reset'}
+            Qelso-Units: {$ref: '#/components/headers/Qelso-Units'}
+            Qelso-Attribution: {$ref: '#/components/headers/Qelso-Attribution'}
+            Qelso-Data-Type: {$ref: '#/components/headers/Qelso-Data-Type'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/CandlesPage'}
+            application/x-ndjson:
+              schema: {type: string, description: One Candle object per line.}
+            text/csv:
+              schema: {type: string, description: 'Header row, then one Candle per row.'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '406': {$ref: '#/components/responses/NotAcceptable'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '504': {$ref: '#/components/responses/Timeout'}
+
+  /v2/markets/{market_id}/stats:
+    get:
+      tags: [History]
+      operationId: getMarketStats
+      summary: Market statistics
+      description: |
+        Volume, open interest, spread and depth for each interval, at 1m and coarser. `volume` covers the interval; the other fields are as of its end. Intervals with no change have `carried: true`.
+
+        **`source`:**
+        - `computed` (Kalshi): spread and depth from the order book and `volume` from trades, the same way on every venue; open interest and `volume_cum` as Kalshi reports them. Volume is in contracts.
+        - `venue_reported` (Polymarket, for now): the venue's own figures.
+          - `volume_cum` is the venue's running total in US dollars.
+          - `volume` is given at 1d only, as the change in the day's highest value of that total.
+          - `liquidity` and `spread` are the venue's; `open_interest` and depth are null.
+
+        **Datasets read:** `stats_1m`, `bars_1m`.
+
+        **Access:** `minute`. **Cost:** 1 unit per page.
+
+        **Streams:** NDJSON or CSV. Resume key: `after=<t>`.
+      parameters:
+        - $ref: '#/components/parameters/MarketId'
+        - $ref: '#/components/parameters/Start'
+        - $ref: '#/components/parameters/End'
+        - name: resolution
+          in: query
+          description: Interval length. Statistics start at 1m.
+          schema: {type: string, enum: ['1m', '10m', '1h', '6h', '1d'], default: '1m'}
+        - name: limit
+          in: query
+          description: Points per page.
+          schema: {type: integer, minimum: 1, maximum: 1000, default: 1000}
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/AfterT'
+      responses:
+        '200':
+          description: A page of statistics, or a stream of them.
+          headers:
+            X-Request-ID: {$ref: '#/components/headers/X-Request-ID'}
+            X-RateLimit-Limit: {$ref: '#/components/headers/X-RateLimit-Limit'}
+            X-RateLimit-Remaining: {$ref: '#/components/headers/X-RateLimit-Remaining'}
+            X-RateLimit-Reset: {$ref: '#/components/headers/X-RateLimit-Reset'}
+            Qelso-Units: {$ref: '#/components/headers/Qelso-Units'}
+            Qelso-Attribution: {$ref: '#/components/headers/Qelso-Attribution'}
+            Qelso-Data-Type: {$ref: '#/components/headers/Qelso-Data-Type'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/StatsPage'}
+            application/x-ndjson:
+              schema: {type: string, description: One StatsPoint object per line.}
+            text/csv:
+              schema: {type: string, description: 'Header row, then one StatsPoint per row.'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '406': {$ref: '#/components/responses/NotAcceptable'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '504': {$ref: '#/components/responses/Timeout'}
+
+  /v2/markets/{market_id}/books:
+    get:
+      tags: [History]
+      operationId: getMarketBooks
+      summary: Order books
+      description: |
+        The order book at one millisecond, or sampled on a time grid. Give either `at`, or `start` and `end` (with `interval`), not both.
+
+        - **`at`:** the book with every change at or before `at` applied. `data` holds one book, with `t` = `at`.
+        - **`start`, `end`, `interval`:** one book per interval `[t, t + interval)` in the window, as of the interval's end, like prices. Intervals with no data at their end have null `bids` and `asks`.
+        - **`last_change`:** the time of the latest change included in each book.
+
+        **Availability:**
+        - **Kalshi:** from 17 October 2026, exact to the millisecond.
+        - **Polymarket:**
+          - At intervals of 1m and coarser, from `book_snapshots`' `available_from` in `GET /v2/venues`: each book is the latest minute book at or before the interval's end. `last_change` is that book's time; the change itself may be earlier.
+          - At a millisecond, or below 1m: from `book_updates`' `available_from` in `GET /v2/venues`. `last_change` there can be earlier or later than the book's latest real change: for exact times, use `book-updates`.
+
+        **Datasets read:** `book_snapshots`, `book_updates`.
+
+        **Access:** `minute` for intervals of 1m and coarser; `subminute` for `at` and for intervals below 1m. **Cost:** 1 unit per page; 5 for `at` and below 1m.
+
+        **Limits:** a page holds up to `limit` books and stops at 100,000 price levels. Below 1m, the window is ≤ 6 h and ≤ 100,000 intervals. On Polymarket below 1m, a page can also stop sooner, on markets whose book changes very often.
+
+        **Streams:** NDJSON only. Resume key: `after=<t>`.
+      parameters:
+        - $ref: '#/components/parameters/MarketId'
+        - name: at
+          in: query
+          description: One book at this instant. Not with `start`, `end` or `interval`.
+          schema: {$ref: '#/components/schemas/TimestampInput'}
+        - {$ref: '#/components/parameters/StartOptional', description: 'Start of the grid (with `end`). Not with `at`.'}
+        - {$ref: '#/components/parameters/EndOptional', description: 'End of the grid, exclusive (with `start`). Not with `at`.'}
+        - name: interval
+          in: query
+          description: Interval length, with `start` and `end` (1m if omitted). Not with `at`.
+          schema: {type: string, enum: ['100ms', '1s', '1m', '10m', '1h', '6h', '1d']}
+        - name: depth
+          in: query
+          description: Price levels per side, best first, or `all`.
+          schema:
+            anyOf:
+              - {type: integer, minimum: 1, maximum: 1000}
+              - {type: string, enum: [all]}
+            default: 10
+        - $ref: '#/components/parameters/Outcome'
+        - name: limit
+          in: query
+          description: Books per page.
+          schema: {type: integer, minimum: 1, maximum: 1000, default: 1000}
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/AfterT'
+      responses:
+        '200':
+          description: A page of books, or an NDJSON stream of them.
+          headers:
+            X-Request-ID: {$ref: '#/components/headers/X-Request-ID'}
+            X-RateLimit-Limit: {$ref: '#/components/headers/X-RateLimit-Limit'}
+            X-RateLimit-Remaining: {$ref: '#/components/headers/X-RateLimit-Remaining'}
+            X-RateLimit-Reset: {$ref: '#/components/headers/X-RateLimit-Reset'}
+            Qelso-Units: {$ref: '#/components/headers/Qelso-Units'}
+            Qelso-Attribution: {$ref: '#/components/headers/Qelso-Attribution'}
+            Qelso-Data-Type: {$ref: '#/components/headers/Qelso-Data-Type'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BooksPage'}
+              examples:
+                book_at_a_millisecond:
+                  summary: The book at one millisecond (illustrative values, top of book)
+                  value:
+                    market:
+                      id: kalshi:KXFEDDECISION-26DEC-H0
+                      venue: kalshi
+                      native_id: KXFEDDECISION-26DEC-H0
+                      title: Fed holds rates in December 2026?
+                      status: open
+                      outcomes: {'yes': {label: Hold, token_id: null}, 'no': {label: 'No', token_id: null}}
+                      open_time: '2026-09-17T18:00:00.000Z'
+                      close_time: '2026-12-09T18:55:00.000Z'
+                    outcome: 'yes'
+                    interval: null
+                    depth: 1
+                    data:
+                      - t: '2026-11-03T14:03:07.250Z'
+                        bids: [[0.47, 600]]
+                        asks: [[0.49, 800]]
+                        last_change: '2026-11-03T14:03:06.981Z'
+                    next_cursor: null
+                    attribution: Powered by Kalshi Research
+                    data_type: historical
+            application/x-ndjson:
+              schema: {type: string, description: One BookSample object per line.}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '406': {$ref: '#/components/responses/NotAcceptable'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '504': {$ref: '#/components/responses/Timeout'}
+
+  /v2/markets/{market_id}/bbo:
+    get:
+      tags: [Ticks]
+      operationId: getMarketBbo
+      summary: Best bid and ask changes
+      description: |
+        Changes of the best bid or ask in `[start, end)`, ordered by `(ts, seq)`. An empty side has a null price and size.
+
+        **Availability:**
+        - **Kalshi:** from 17 October 2026.
+        - **Polymarket:** from `bbo`'s `available_from` in `GET /v2/venues`.
+
+        **Datasets read:** `bbo`.
+
+        **Access:** `ticks`. **Cost:** 10 units per page; rows count against your ticks quota. **Window:** ≤ 6 h (streams ≤ 24 h).
+
+        **Streams:** NDJSON or CSV. Resume key: `after=<ts>,<seq>`.
+      parameters:
+        - $ref: '#/components/parameters/MarketId'
+        - $ref: '#/components/parameters/Start'
+        - $ref: '#/components/parameters/End'
+        - $ref: '#/components/parameters/Outcome'
+        - $ref: '#/components/parameters/TickLimit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: after
+          in: query
+          description: 'Streams only: resume after this row. Format `<ts>,<seq>`, from the last row received.'
+          schema: {type: string, maxLength: 128, examples: ['2026-11-03T14:21:07.120Z,3']}
+      responses:
+        '200':
+          description: A page of best bid/ask changes, or a stream of them.
+          headers:
+            X-Request-ID: {$ref: '#/components/headers/X-Request-ID'}
+            X-RateLimit-Limit: {$ref: '#/components/headers/X-RateLimit-Limit'}
+            X-RateLimit-Remaining: {$ref: '#/components/headers/X-RateLimit-Remaining'}
+            X-RateLimit-Reset: {$ref: '#/components/headers/X-RateLimit-Reset'}
+            Qelso-Units: {$ref: '#/components/headers/Qelso-Units'}
+            Qelso-Attribution: {$ref: '#/components/headers/Qelso-Attribution'}
+            Qelso-Data-Type: {$ref: '#/components/headers/Qelso-Data-Type'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BboPage'}
+            application/x-ndjson:
+              schema: {type: string, description: One BboRow object per line.}
+              example: |
+                {"ts":"2026-11-03T14:00:00.412Z","seq":1,"bid":0.47,"bid_size":600,"ask":0.49,"ask_size":800}
+                {"ts":"2026-11-03T14:00:01.090Z","seq":2,"bid":0.48,"bid_size":50,"ask":0.49,"ask_size":800}
+            text/csv:
+              schema: {type: string, description: 'Header row, then one BboRow per row.'}
+              example: |
+                ts,seq,bid,bid_size,ask,ask_size
+                2026-11-03T14:00:00.412Z,1,0.47,600,0.49,800
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '406': {$ref: '#/components/responses/NotAcceptable'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '504': {$ref: '#/components/responses/Timeout'}
+
+  /v2/markets/{market_id}/book-updates:
+    get:
+      tags: [Ticks]
+      operationId: getMarketBookUpdates
+      summary: Order-book changes
+      description: |
+        The book as it stood just before `start` (every earlier change applied), then the price-level changes in `[start, end)`. Apply the rows in order to keep a full book.
+
+        - **Starting book:** the first page (and the start of a stream) lists it as `kind: snapshot` rows, one per level, at every depth. A large book can run over several pages.
+        - **Changes:** then come `kind: update` rows.
+          - `size` is the level's size after the change; 0 means the level was removed.
+          - `delta` is the change from before.
+        - **Order:** `(ts, seq, side, price)`.
+
+        **Availability:**
+        - **Kalshi:** from 17 October 2026.
+        - **Polymarket:** from `book_updates`' `available_from` in `GET /v2/venues`.
+
+        **Datasets read:** `book_snapshots`, `book_updates`.
+
+        **Access:** `ticks`. **Cost:** 10 units per page; rows count against your ticks quota. **Window:** ≤ 6 h (streams ≤ 24 h).
+
+        **Streams:** NDJSON or CSV. Resume key: `after=<ts>,<seq>,<side>,<price>`. A resumed stream skips the starting book. If a stream breaks before its first `update` row, start again without `after`.
+      parameters:
+        - $ref: '#/components/parameters/MarketId'
+        - $ref: '#/components/parameters/Start'
+        - $ref: '#/components/parameters/End'
+        - $ref: '#/components/parameters/Outcome'
+        - $ref: '#/components/parameters/TickLimit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: after
+          in: query
+          description: 'Streams only: resume after this row. Format `<ts>,<seq>,<side>,<price>`, from the last row received.'
+          schema: {type: string, maxLength: 160, examples: ['2026-11-03T14:21:07.120Z,3,bid,0.47']}
+      responses:
+        '200':
+          description: A page of book changes, or a stream of them.
+          headers:
+            X-Request-ID: {$ref: '#/components/headers/X-Request-ID'}
+            X-RateLimit-Limit: {$ref: '#/components/headers/X-RateLimit-Limit'}
+            X-RateLimit-Remaining: {$ref: '#/components/headers/X-RateLimit-Remaining'}
+            X-RateLimit-Reset: {$ref: '#/components/headers/X-RateLimit-Reset'}
+            Qelso-Units: {$ref: '#/components/headers/Qelso-Units'}
+            Qelso-Attribution: {$ref: '#/components/headers/Qelso-Attribution'}
+            Qelso-Data-Type: {$ref: '#/components/headers/Qelso-Data-Type'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/BookUpdatesPage'}
+            application/x-ndjson:
+              schema: {type: string, description: One BookUpdateRow object per line.}
+            text/csv:
+              schema: {type: string, description: 'Header row, then one BookUpdateRow per row.'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '406': {$ref: '#/components/responses/NotAcceptable'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '504': {$ref: '#/components/responses/Timeout'}
+
+  /v2/markets/{market_id}/trades:
+    get:
+      tags: [Ticks]
+      operationId: getMarketTrades
+      summary: Trades
+      description: |
+        Trades in `[start, end)`, ordered by `(ts, seq)`.
+
+        - `(ts, seq)` is execution order, except on Kalshi before 18 October 2026: trades there that share a `ts` keep a fixed order, which may not be the order they executed in.
+        - `price` is in terms of the requested outcome.
+        - `aggressor` says whether the taker bought or sold that outcome; it is `unknown` where the venue doesn't say.
+        - Combo (multivariate) trades are not included.
+
+        **Availability:**
+        - **Kalshi:** from `trades`' `available_from` in `GET /v2/venues` (it moves earlier as history is loaded).
+        - **Polymarket:** from `trades`' `available_from` in `GET /v2/venues`: the trades of each market the API lists, from its first.
+          - Each row is the fill of one maker order: a taker order that fills several resting orders gives one row per order, in the order the chain recorded them.
+          - `ts` is a whole second: when the trade settled, typically about 2 seconds after it matched. Trades can't be placed exactly among book changes within that gap.
+          - `trade_id` is `<transaction hash>:<log index>`. `size` is the shares filled, before any fee.
+
+        **Datasets read:** `trades`.
+
+        **Access:** `ticks`. **Cost:** 10 units per page; rows count against your ticks quota. **Window:** ≤ 31 days (streams too).
+
+        **Streams:** NDJSON or CSV. Resume key: `after=<ts>,<seq>`.
+      parameters:
+        - $ref: '#/components/parameters/MarketId'
+        - $ref: '#/components/parameters/Start'
+        - $ref: '#/components/parameters/End'
+        - $ref: '#/components/parameters/Outcome'
+        - $ref: '#/components/parameters/TickLimit'
+        - $ref: '#/components/parameters/Cursor'
+        - name: after
+          in: query
+          description: 'Streams only: resume after this row. Format `<ts>,<seq>`, from the last row received.'
+          schema: {type: string, maxLength: 128, examples: ['2026-11-03T14:21:07.120Z,2']}
+      responses:
+        '200':
+          description: A page of trades, or a stream of them.
+          headers:
+            X-Request-ID: {$ref: '#/components/headers/X-Request-ID'}
+            X-RateLimit-Limit: {$ref: '#/components/headers/X-RateLimit-Limit'}
+            X-RateLimit-Remaining: {$ref: '#/components/headers/X-RateLimit-Remaining'}
+            X-RateLimit-Reset: {$ref: '#/components/headers/X-RateLimit-Reset'}
+            Qelso-Units: {$ref: '#/components/headers/Qelso-Units'}
+            Qelso-Attribution: {$ref: '#/components/headers/Qelso-Attribution'}
+            Qelso-Data-Type: {$ref: '#/components/headers/Qelso-Data-Type'}
+          content:
+            application/json:
+              schema: {$ref: '#/components/schemas/TradesPage'}
+            application/x-ndjson:
+              schema: {type: string, description: One TradeRow object per line.}
+            text/csv:
+              schema: {type: string, description: 'Header row, then one TradeRow per row.'}
+        '400': {$ref: '#/components/responses/BadRequest'}
+        '401': {$ref: '#/components/responses/Unauthorized'}
+        '403': {$ref: '#/components/responses/Forbidden'}
+        '404': {$ref: '#/components/responses/NotFound'}
+        '406': {$ref: '#/components/responses/NotAcceptable'}
+        '429': {$ref: '#/components/responses/TooManyRequests'}
+        '500': {$ref: '#/components/responses/InternalError'}
+        '503': {$ref: '#/components/responses/Unavailable'}
+        '504': {$ref: '#/components/responses/Timeout'}
+
+components:
+  securitySchemes:
+    ApiKeyAuth:
+      type: apiKey
+      in: header
+      name: X-API-Key
+      description: 'Your API key, created in the dashboard. Example: `X-API-Key: pk_live_your_key_here`.'
+
+  headers:
+    X-Request-ID:
+      description: Unique ID of this request. Quote it when you contact support.
+      schema: {type: string}
+    X-RateLimit-Limit:
+      description: Units your organisation may use per minute. Absent when unlimited.
+      schema: {type: integer}
+    X-RateLimit-Remaining:
+      description: Units left in the current minute.
+      schema: {type: integer}
+    X-RateLimit-Reset:
+      description: Epoch seconds when the current minute window resets.
+      schema: {type: integer}
+    Qelso-Units:
+      description: Units this request cost. A stream costs its endpoint's page cost; its rows count against your monthly quota instead.
+      schema: {type: integer, minimum: 0}
+    Retry-After:
+      description: Seconds to wait before retrying.
+      schema: {type: integer, minimum: 0}
+    Qelso-Attribution:
+      description: Present when the response contains Kalshi data. Always `Powered by Kalshi Research`.
+      schema: {type: string, enum: [Powered by Kalshi Research]}
+    Qelso-Data-Type:
+      description: Present when the response contains Kalshi data. `historical` if all of it is at least 24 hours old, otherwise `delayed`.
+      schema: {type: string, enum: [historical, delayed]}
+
+  parameters:
+    MarketId:
+      name: market_id
+      in: path
+      required: true
+      description: Venue-qualified market ID. For Polymarket, the part after the colon may also be the slug.
+      schema: {$ref: '#/components/schemas/MarketId'}
+    VenueFilter:
+      name: venue
+      in: query
+      description: Only these venues (repeat the parameter for several). Defaults to every venue your key can read.
+      style: form
+      explode: true
+      schema:
+        type: array
+        items: {$ref: '#/components/schemas/Venue'}
+        uniqueItems: true
+    CategoryFilter:
+      name: category
+      in: query
+      description: One of our category codes (`GET /v2/categories`).
+      schema: {type: string, pattern: '^[a-z0-9_\-]{1,64}$'}
+    StatusFilter:
+      name: status
+      in: query
+      description: Only these statuses (repeat the parameter for several).
+      style: form
+      explode: true
+      schema:
+        type: array
+        items: {$ref: '#/components/schemas/MarketStatus'}
+        uniqueItems: true
+    SeriesFilter:
+      name: series
+      in: query
+      description: Only this series.
+      schema: {$ref: '#/components/schemas/SeriesId'}
+    EventFilter:
+      name: event
+      in: query
+      description: Only this event.
+      schema: {$ref: '#/components/schemas/EventId'}
+    Search:
+      name: search
+      in: query
+      description: Words to find in titles, slugs and tickers.
+      schema: {type: string, minLength: 1, maxLength: 200}
+    Ids:
+      name: ids
+      in: query
+      description: Comma-separated venue-qualified IDs, up to 100.
+      style: form
+      explode: false
+      schema:
+        type: array
+        items: {type: string, pattern: '^[a-z][a-z0-9_]{1,31}:[^/\s,]{1,256}$'}
+        minItems: 1
+        maxItems: 100
+    OpenFrom:
+      name: open_from
+      in: query
+      description: Markets that open at or after this time.
+      schema: {$ref: '#/components/schemas/TimestampInput'}
+    OpenTo:
+      name: open_to
+      in: query
+      description: Markets that open before this time.
+      schema: {$ref: '#/components/schemas/TimestampInput'}
+    CloseFrom:
+      name: close_from
+      in: query
+      description: Markets that close at or after this time.
+      schema: {$ref: '#/components/schemas/TimestampInput'}
+    CloseTo:
+      name: close_to
+      in: query
+      description: Markets that close before this time.
+      schema: {$ref: '#/components/schemas/TimestampInput'}
+    UpdatedSince:
+      name: updated_since
+      in: query
+      description: Only items whose `updated_at` is at or after this time.
+      schema: {$ref: '#/components/schemas/TimestampInput'}
+    Order:
+      name: order
+      in: query
+      schema: {type: string, enum: [asc, desc], default: desc}
+    DiscoveryLimit:
+      name: limit
+      in: query
+      description: Items per page.
+      schema: {type: integer, minimum: 1, maximum: 1000, default: 100}
+    HistoryLimit:
+      name: limit
+      in: query
+      description: Points per page. Up to 1,000 at 1m and coarser (default 1,000); up to 10,000 at 1s and 100ms (default 10,000).
+      schema: {type: integer, minimum: 1, maximum: 10000}
+    TickLimit:
+      name: limit
+      in: query
+      description: Rows per page.
+      schema: {type: integer, minimum: 1, maximum: 10000, default: 10000}
+    Cursor:
+      name: cursor
+      in: query
+      description: The `next_cursor` from the previous page. Send it with the same parameters.
+      schema: {type: string, minLength: 1, maxLength: 4096}
+    Start:
+      name: start
+      in: query
+      required: true
+      description: Start of the window, inclusive.
+      schema: {$ref: '#/components/schemas/TimestampInput'}
+    End:
+      name: end
+      in: query
+      required: true
+      description: End of the window, exclusive. A time later than now is treated as now, before window limits are checked.
+      schema: {$ref: '#/components/schemas/TimestampInput'}
+    StartOptional:
+      name: start
+      in: query
+      description: Start of the window, inclusive.
+      schema: {$ref: '#/components/schemas/TimestampInput'}
+    EndOptional:
+      name: end
+      in: query
+      description: End of the window, exclusive.
+      schema: {$ref: '#/components/schemas/TimestampInput'}
+    Resolution:
+      name: resolution
+      in: query
+      description: Interval length.
+      schema: {$ref: '#/components/schemas/Resolution'}
+    Outcome:
+      name: outcome
+      in: query
+      description: '`yes` (default) or `no`. On markets with other labels (two teams, Over/Under, Up/Down), `yes` is the venue''s first-listed outcome; `market.outcomes` in the response names both. The NO view mirrors the YES book: prices become 1 − p, bids and asks swap (so do candle highs and lows), and trade aggressors flip.'
+      schema: {$ref: '#/components/schemas/Outcome'}
+    AfterT:
+      name: after
+      in: query
+      description: 'Streams only: resume after the interval starting at this time (the last row''s `t`).'
+      schema: {$ref: '#/components/schemas/TimestampInput'}
+
+  responses:
+    BadRequest:
+      description: '`invalid_parameter`, `invalid_cursor` or `window_too_large`.'
+      headers:
+        X-Request-ID: {$ref: '#/components/headers/X-Request-ID'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          example:
+            error:
+              code: window_too_large
+              message: This request serves at most 6 hours. Use a stream for more.
+              request_id: 4f0c2a9e-0b7e-4f3e-9a51-2a8c3d1f6e20
+              details: {parameter: end, max: PT6H}
+    Unauthorized:
+      description: '`unauthorized`.'
+      headers:
+        X-Request-ID: {$ref: '#/components/headers/X-Request-ID'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          example:
+            error: {code: unauthorized, message: Missing or invalid API key., request_id: 0a6f9c1e-55b2-4d7c-8a0e-6b3f2c9d1e44}
+    Forbidden:
+      description: '`forbidden_venue`, `forbidden_dataset`, `plan_history_limit`, `plan_resolution_not_allowed` or `suspended`.'
+      headers:
+        X-Request-ID: {$ref: '#/components/headers/X-Request-ID'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          example:
+            error:
+              code: forbidden_dataset
+              message: Your access to kalshi doesn't include tick data.
+              request_id: 7d2e1b4a-9c3f-4e8d-b6a1-5f0e2c7d9a13
+              details: {venue: kalshi, entitlement: ticks, reason: not_in_plan}
+    NotFound:
+      description: '`not_found`.'
+      headers:
+        X-Request-ID: {$ref: '#/components/headers/X-Request-ID'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          example:
+            error: {code: not_found, message: 'Market kalshi:KXNOPE-26 not found.', request_id: 2c9e7a1f-3b6d-4f0a-8e5c-1d4b7a2f9e61}
+    NotAcceptable:
+      description: '`not_acceptable`: this endpoint can''t return the format in `Accept`.'
+      headers:
+        X-Request-ID: {$ref: '#/components/headers/X-Request-ID'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    TooManyRequests:
+      description: '`rate_limited` or `quota_exceeded`.'
+      headers:
+        X-Request-ID: {$ref: '#/components/headers/X-Request-ID'}
+        Retry-After: {$ref: '#/components/headers/Retry-After'}
+        X-RateLimit-Limit: {$ref: '#/components/headers/X-RateLimit-Limit'}
+        X-RateLimit-Remaining: {$ref: '#/components/headers/X-RateLimit-Remaining'}
+        X-RateLimit-Reset: {$ref: '#/components/headers/X-RateLimit-Reset'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+          example:
+            error: {code: rate_limited, message: Rate limit exceeded; retry in 12 seconds., request_id: 9b1d3f7e-2a4c-4e6b-8d0f-3c5a7e9b1d24, details: {limit: units_per_minute}}
+    InternalError:
+      description: '`internal_error`.'
+      headers:
+        X-Request-ID: {$ref: '#/components/headers/X-Request-ID'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    Unavailable:
+      description: '`metadata_refreshing` or `service_unavailable`.'
+      headers:
+        X-Request-ID: {$ref: '#/components/headers/X-Request-ID'}
+        Retry-After: {$ref: '#/components/headers/Retry-After'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+    Timeout:
+      description: '`timeout`: the query ran over its time limit.'
+      headers:
+        X-Request-ID: {$ref: '#/components/headers/X-Request-ID'}
+      content:
+        application/json:
+          schema: {$ref: '#/components/schemas/Error'}
+
+  schemas:
+    # ---------- scalars and enums ----------
+    MarketId:
+      type: string
+      description: Venue and the venue's market ID, separated by a colon.
+      pattern: '^[a-z][a-z0-9_]{1,31}:[^/\s]{1,256}$'
+      examples: ['kalshi:KXFEDDECISION-26OCT-H0', 'polymarket:560868']
+    EventId:
+      type: string
+      pattern: '^[a-z][a-z0-9_]{1,31}:[^/\s]{1,256}$'
+      examples: ['kalshi:KXFEDDECISION-26OCT', 'polymarket:16089']
+    SeriesId:
+      type: string
+      pattern: '^[a-z][a-z0-9_]{1,31}:[^/\s]{1,256}$'
+      examples: ['kalshi:KXFEDDECISION', 'polymarket:10345']
+    Venue:
+      description: 'A venue code. Known values: `kalshi`, `polymarket`; more will be added.'
+      anyOf:
+        - {type: string, enum: [kalshi, polymarket]}
+        - {type: string, pattern: '^[a-z][a-z0-9_]{1,31}$'}
+    MarketStatus:
+      type: string
+      description: |
+        The same five statuses on every venue:
+
+        | Status | Kalshi | Polymarket |
+        |---|---|---|
+        | `unopened` | `initialized` | — |
+        | `open` | `active` | open |
+        | `paused` | `inactive` | — |
+        | `closed` | past close, not yet finalized (`closed`, `determined`, `disputed`, `amended`) | closed, no result yet |
+        | `settled` | `finalized` | resolved |
+
+        `venue_status` gives the venue's own value. A result can appear while a market is still `closed` (Kalshi `determined`), and can change after a dispute.
+      enum: [unopened, open, paused, closed, settled]
+    Outcome:
+      type: string
+      enum: ['yes', 'no']
+      default: 'yes'
+    Resolution:
+      type: string
+      enum: ['100ms', '1s', '1m', '10m', '1h', '6h', '1d']
+      default: '1m'
+    Dataset:
+      description: |
+        Stored datasets, as used by venues and access grants (more may be added):
+
+        | Dataset | Holds |
+        |---|---|
+        | `book_updates` | Price-level changes |
+        | `book_snapshots` | Full books at points in time: at least every hour, and at the end of each minute with a change |
+        | `bbo` | Best bid/ask changes |
+        | `trades` | Trades |
+        | `bars_1m` | Minute bars |
+        | `stats_1m` | Minute statistics |
+        | `candles` | Bid, ask and trade-price open, high, low and close per minute, hour and day, with volume and open interest (Kalshi) |
+        | `lifecycle` | Lifecycle changes |
+        | `markets` | Market metadata versions |
+        | `events` | Event metadata versions |
+        | `series` | Series metadata versions |
+      anyOf:
+        - {type: string, enum: [book_updates, book_snapshots, bbo, trades, bars_1m, stats_1m, candles, lifecycle, markets, events, series]}
+        - {type: string, pattern: '^[a-z][a-z0-9_]{1,63}$'}
+    Entitlement:
+      description: |
+        Units of access, granted per venue (more may be added):
+
+        | Entitlement | Covers |
+        |---|---|
+        | `reference` | Series, events, markets, lifecycle |
+        | `minute` | Prices, candles, stats and books at 1m and coarser |
+        | `subminute` | Prices and candles at 1s and 100ms; books at a millisecond or below 1m |
+        | `ticks` | bbo, book-updates, trades |
+      anyOf:
+        - {type: string, enum: [reference, minute, subminute, ticks]}
+        - {type: string}
+    TimestampInput:
+      description: RFC 3339 date-time (no offset means UTC), a date (midnight UTC), or epoch milliseconds.
+      anyOf:
+        - {type: string, format: date-time}
+        - {type: string, format: date}
+        - {type: integer, minimum: 100000000000, description: Epoch milliseconds.}
+      examples: ['2026-11-03T14:00:00Z', '2026-11-03', 1793714400000]
+    Time:
+      type: string
+      format: date-time
+      description: RFC 3339 UTC with milliseconds.
+      pattern: '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$'
+      examples: ['2026-11-03T14:03:07.250Z']
+    Price:
+      type: number
+      minimum: 0
+      maximum: 1
+      description: Dollars per $1 contract (the implied probability), up to 6 decimals.
+    Size:
+      type: number
+      minimum: 0
+      description: Contracts (Kalshi) or shares (Polymarket), up to 6 decimals.
+    PriceLevel:
+      type: array
+      description: One price level as `[price, size]`.
+      prefixItems:
+        - {$ref: '#/components/schemas/Price'}
+        - {$ref: '#/components/schemas/Size'}
+      items: false
+      minItems: 2
+      maxItems: 2
+      examples: [[0.47, 600]]
+    Attribution:
+      type: string
+      description: Present when the response contains Kalshi data.
+      enum: [Powered by Kalshi Research]
+    DataType:
+      type: string
+      description: Present when the response contains Kalshi data. `historical` if all of it is at least 24 hours old, otherwise `delayed`.
+      enum: [historical, delayed]
+    NextCursor:
+      type: [string, 'null']
+      description: Pass as `cursor` for the next page; null on the last page.
+
+    # ---------- reference ----------
+    VenueInfo:
+      type: object
+      required: [venue, name, attribution, datasets]
+      properties:
+        venue: {$ref: '#/components/schemas/Venue'}
+        name: {type: string, examples: [Kalshi]}
+        attribution:
+          anyOf: [{$ref: '#/components/schemas/Attribution'}, {type: 'null'}]
+          description: Text that must accompany this venue's data, or null.
+        datasets:
+          type: array
+          description: The datasets offered on this venue.
+          items: {$ref: '#/components/schemas/VenueDataset'}
+    VenueDataset:
+      type: object
+      required: [dataset, entitlement, available_from, note]
+      properties:
+        dataset: {$ref: '#/components/schemas/Dataset'}
+        entitlement:
+          $ref: '#/components/schemas/Entitlement'
+          description: >-
+            The entitlement that covers this dataset's own rows. Endpoints built from it can need a different
+            one: trade candles and books at 1m or coarser need only `minute` (they read `trades` and
+            `book_snapshots`), and books below 1m need `subminute`.
+        available_from:
+          anyOf: [{$ref: '#/components/schemas/Time'}, {type: 'null'}]
+          description: The first time this dataset has data on this venue. Null if none yet.
+        note: {type: [string, 'null'], description: Anything a user should know about this dataset on this venue.}
+    VenueList:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items: {$ref: '#/components/schemas/VenueInfo'}
+    Category:
+      type: object
+      required: [code, name, venue_categories]
+      properties:
+        code: {type: string, examples: [economics]}
+        name: {type: string, examples: [Economics]}
+        venue_categories:
+          type: array
+          description: The venue categories mapped to this category.
+          items:
+            type: object
+            required: [venue, name]
+            properties:
+              venue: {$ref: '#/components/schemas/Venue'}
+              name: {type: string}
+    CategoryList:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items: {$ref: '#/components/schemas/Category'}
+
+    # ---------- discovery ----------
+    OutcomeInfo:
+      type: object
+      required: [label, token_id]
+      properties:
+        label: {type: string, description: 'The venue''s label for this outcome, e.g. "Yes", "Hold" or a team name. On Kalshi, `yes` is the market''s own short line (e.g. "Over 9.5 points"), or "Yes" when it has none, and `no` is "No".'}
+        token_id: {type: [string, 'null'], description: Polymarket's token ID for this outcome; null on Kalshi.}
+    Outcomes:
+      type: object
+      required: ['yes', 'no']
+      properties:
+        'yes': {$ref: '#/components/schemas/OutcomeInfo'}
+        'no': {$ref: '#/components/schemas/OutcomeInfo'}
+    MarketRef:
+      type: object
+      description: The market a history response is about.
+      required: [id, venue, native_id, title, status, outcomes, open_time, close_time]
+      properties:
+        id: {$ref: '#/components/schemas/MarketId'}
+        venue: {$ref: '#/components/schemas/Venue'}
+        native_id: {type: string}
+        title: {type: string}
+        status: {$ref: '#/components/schemas/MarketStatus'}
+        outcomes: {$ref: '#/components/schemas/Outcomes'}
+        open_time:
+          anyOf: [{$ref: '#/components/schemas/Time'}, {type: 'null'}]
+        close_time:
+          anyOf: [{$ref: '#/components/schemas/Time'}, {type: 'null'}]
+    Series:
+      type: object
+      required: [id, venue, native_id, title, category, venue_category, tags, frequency, created_at, updated_at]
+      properties:
+        id: {$ref: '#/components/schemas/SeriesId'}
+        venue: {$ref: '#/components/schemas/Venue'}
+        native_id: {type: string}
+        title: {type: string}
+        category: {type: [string, 'null'], description: Our category code.}
+        venue_category: {type: [string, 'null']}
+        tags: {type: array, items: {type: string}}
+        frequency: {type: [string, 'null'], description: 'The venue''s description of how often events recur, e.g. "monthly".'}
+        created_at:
+          anyOf: [{$ref: '#/components/schemas/Time'}, {type: 'null'}]
+        updated_at: {$ref: '#/components/schemas/Time'}
+    Event:
+      type: object
+      required: [id, venue, native_id, series_id, title, subtitle, category, venue_category, tags, mutually_exclusive, start_time, end_time, market_count, created_at, updated_at]
+      properties:
+        id: {$ref: '#/components/schemas/EventId'}
+        venue: {$ref: '#/components/schemas/Venue'}
+        native_id: {type: string}
+        series_id:
+          anyOf: [{$ref: '#/components/schemas/SeriesId'}, {type: 'null'}]
+        title: {type: string}
+        subtitle: {type: [string, 'null']}
+        category: {type: [string, 'null']}
+        venue_category: {type: [string, 'null']}
+        tags: {type: array, items: {type: string}}
+        mutually_exclusive: {type: [boolean, 'null'], description: True if at most one of the event's markets can resolve YES. Null if the venue doesn't say.}
+        start_time:
+          anyOf: [{$ref: '#/components/schemas/Time'}, {type: 'null'}]
+          description: Earliest open time of the event's markets.
+        end_time:
+          anyOf: [{$ref: '#/components/schemas/Time'}, {type: 'null'}]
+          description: Latest close time of the event's markets.
+        market_count: {type: integer, minimum: 0}
+        created_at:
+          anyOf: [{$ref: '#/components/schemas/Time'}, {type: 'null'}]
+        updated_at: {$ref: '#/components/schemas/Time'}
+    Market:
+      type: object
+      required: [id, venue, native_id, event_id, series_id, title, subtitle, market_type, outcomes, status, venue_status, open_time, close_time, settled_time, result, category, created_at, updated_at]
+      properties:
+        id: {$ref: '#/components/schemas/MarketId'}
+        venue: {$ref: '#/components/schemas/Venue'}
+        native_id: {type: string, description: 'Kalshi ticker, or Polymarket''s numeric market ID.'}
+        event_id:
+          anyOf: [{$ref: '#/components/schemas/EventId'}, {type: 'null'}]
+        series_id:
+          anyOf: [{$ref: '#/components/schemas/SeriesId'}, {type: 'null'}]
+        title: {type: string}
+        subtitle: {type: [string, 'null']}
+        market_type: {type: string, enum: [binary, scalar], description: '`binary` settles at 0 or 1; `scalar` anywhere from 0 to 1.'}
+        outcomes: {$ref: '#/components/schemas/Outcomes'}
+        status: {$ref: '#/components/schemas/MarketStatus'}
+        venue_status: {type: string, description: The venue's own status value.}
+        open_time:
+          anyOf: [{$ref: '#/components/schemas/Time'}, {type: 'null'}]
+        close_time:
+          anyOf: [{$ref: '#/components/schemas/Time'}, {type: 'null'}]
+        settled_time:
+          anyOf: [{$ref: '#/components/schemas/Time'}, {type: 'null'}]
+        result:
+          type: [string, 'null']
+          enum: ['yes', 'no', scalar, null]
+          description: Null until the venue publishes a result. It can change after a dispute.
+        category: {type: [string, 'null']}
+        created_at:
+          anyOf: [{$ref: '#/components/schemas/Time'}, {type: 'null'}]
+        updated_at: {$ref: '#/components/schemas/Time'}
+    MarketDetail:
+      type: object
+      required: [id, venue, native_id, native, event_id, series_id, title, subtitle, rules_primary, rules_secondary, market_type, outcomes, status, venue_status, created_at, open_time, close_time, expected_expiration_time, latest_expiration_time, settled_time, result, settlement_value, tick_structure, settlement_sources, category, venue_category, tags, updated_at, venue_extra]
+      properties:
+        id: {$ref: '#/components/schemas/MarketId'}
+        venue: {$ref: '#/components/schemas/Venue'}
+        native_id: {type: string}
+        native:
+          type: object
+          description: The venue's own identifiers. Fields a venue doesn't have are null.
+          required: [market_id, slug, uuid, condition_id]
+          properties:
+            market_id: {type: string, description: Kalshi ticker or Polymarket market ID.}
+            slug: {type: [string, 'null'], description: Polymarket slug.}
+            uuid: {type: [string, 'null'], description: Kalshi's stable market UUID.}
+            condition_id: {type: [string, 'null'], description: Polymarket condition ID.}
+        event_id:
+          anyOf: [{$ref: '#/components/schemas/EventId'}, {type: 'null'}]
+        series_id:
+          anyOf: [{$ref: '#/components/schemas/SeriesId'}, {type: 'null'}]
+        title: {type: string}
+        subtitle: {type: [string, 'null']}
+        rules_primary: {type: [string, 'null'], description: The main resolution rules (Polymarket's description).}
+        rules_secondary: {type: [string, 'null']}
+        market_type: {type: string, enum: [binary, scalar]}
+        outcomes: {$ref: '#/components/schemas/Outcomes'}
+        status: {$ref: '#/components/schemas/MarketStatus'}
+        venue_status: {type: string}
+        created_at:
+          anyOf: [{$ref: '#/components/schemas/Time'}, {type: 'null'}]
+        open_time:
+          anyOf: [{$ref: '#/components/schemas/Time'}, {type: 'null'}]
+        close_time:
+          anyOf: [{$ref: '#/components/schemas/Time'}, {type: 'null'}]
+        expected_expiration_time:
+          anyOf: [{$ref: '#/components/schemas/Time'}, {type: 'null'}]
+        latest_expiration_time:
+          anyOf: [{$ref: '#/components/schemas/Time'}, {type: 'null'}]
+        settled_time:
+          anyOf: [{$ref: '#/components/schemas/Time'}, {type: 'null'}]
+        result:
+          type: [string, 'null']
+          enum: ['yes', 'no', scalar, null]
+        settlement_value:
+          anyOf: [{$ref: '#/components/schemas/Price'}, {type: 'null'}]
+          description: What a YES contract paid (0 to 1). Null until settled.
+        tick_structure:
+          type: [array, 'null']
+          description: The allowed price ranges and their tick sizes. Null where we don't hold it.
+          items:
+            type: object
+            required: [start, end, step]
+            properties:
+              start: {$ref: '#/components/schemas/Price'}
+              end: {$ref: '#/components/schemas/Price'}
+              step: {type: number, exclusiveMinimum: 0}
+        settlement_sources:
+          type: array
+          items:
+            type: object
+            required: [name, url]
+            properties:
+              name: {type: string}
+              url: {type: [string, 'null']}
+        category: {type: [string, 'null']}
+        venue_category: {type: [string, 'null']}
+        tags: {type: array, items: {type: string}}
+        updated_at: {$ref: '#/components/schemas/Time'}
+        venue_extra:
+          type: object
+          additionalProperties: true
+          description: Venue-specific fields we don't map, with the venue's names (for example Kalshi's `strike_type`, `floor_strike`, `can_close_early`).
+    SeriesList:
+      type: object
+      required: [data, next_cursor]
+      properties:
+        data: {type: array, items: {$ref: '#/components/schemas/Series'}}
+        next_cursor: {$ref: '#/components/schemas/NextCursor'}
+        attribution: {$ref: '#/components/schemas/Attribution'}
+        data_type: {$ref: '#/components/schemas/DataType'}
+    EventList:
+      type: object
+      required: [data, next_cursor]
+      properties:
+        data: {type: array, items: {$ref: '#/components/schemas/Event'}}
+        next_cursor: {$ref: '#/components/schemas/NextCursor'}
+        attribution: {$ref: '#/components/schemas/Attribution'}
+        data_type: {$ref: '#/components/schemas/DataType'}
+    MarketList:
+      type: object
+      required: [data, next_cursor]
+      properties:
+        data: {type: array, items: {$ref: '#/components/schemas/Market'}}
+        next_cursor: {$ref: '#/components/schemas/NextCursor'}
+        attribution: {$ref: '#/components/schemas/Attribution'}
+        data_type: {$ref: '#/components/schemas/DataType'}
+    MarketResponse:
+      type: object
+      required: [data]
+      properties:
+        data: {$ref: '#/components/schemas/MarketDetail'}
+        attribution: {$ref: '#/components/schemas/Attribution'}
+        data_type: {$ref: '#/components/schemas/DataType'}
+    LifecycleChange:
+      type: object
+      required: [ts, type, status, details, source]
+      properties:
+        ts: {$ref: '#/components/schemas/Time'}
+        type:
+          description: What happened. More values may be added.
+          anyOf:
+            - {type: string, enum: [created, opened, paused, resumed, close_time_changed, closed, determined, disputed, amended, settled, rules_changed, tick_structure_changed, metadata_changed]}
+            - {type: string}
+        status:
+          anyOf: [{$ref: '#/components/schemas/MarketStatus'}, {type: 'null'}]
+          description: The market's status after this change.
+        details:
+          type: object
+          additionalProperties: true
+          description: 'What changed, e.g. `{"field": "close_time", "from": "…", "to": "…"}` or `{"result": "yes", "settlement_value": 1}`.'
+        source:
+          type: string
+          enum: [venue_event, metadata_version, inferred]
+          description: '`venue_event`: a lifecycle message from the venue. `metadata_version`: found by comparing metadata versions. `inferred`: from a scheduled time passing.'
+    LifecyclePage:
+      type: object
+      required: [market, data, next_cursor]
+      properties:
+        market: {$ref: '#/components/schemas/MarketRef'}
+        data: {type: array, items: {$ref: '#/components/schemas/LifecycleChange'}}
+        next_cursor: {$ref: '#/components/schemas/NextCursor'}
+        attribution: {$ref: '#/components/schemas/Attribution'}
+        data_type: {$ref: '#/components/schemas/DataType'}
+
+    # ---------- history rows ----------
+    PricePoint:
+      type: object
+      required: [t, carried]
+      properties:
+        t: {$ref: '#/components/schemas/Time'}
+        bid:
+          anyOf: [{$ref: '#/components/schemas/Price'}, {type: 'null'}]
+          description: Best bid at the end of the interval; null if the bid side is empty or not available.
+        ask:
+          anyOf: [{$ref: '#/components/schemas/Price'}, {type: 'null'}]
+          description: Best ask at the end of the interval; null if the ask side is empty or not available.
+        mid:
+          anyOf: [{$ref: '#/components/schemas/Price'}, {type: 'null'}]
+          description: (bid + ask) / 2, with an empty bid as 0 and an empty ask as 1; null if both sides are empty.
+        last:
+          anyOf: [{$ref: '#/components/schemas/Price'}, {type: 'null'}]
+          description: The last trade before the end of the interval; null if there was none or trades aren't available.
+        carried: {type: boolean, description: 'True if nothing changed in this interval, so the values repeat the previous row''s.'}
+    Candle:
+      type: object
+      required: [t, open, high, low, close, volume, trades, vwap, carried]
+      properties:
+        t: {$ref: '#/components/schemas/Time'}
+        open:
+          anyOf: [{$ref: '#/components/schemas/Price'}, {type: 'null'}]
+        high:
+          anyOf: [{$ref: '#/components/schemas/Price'}, {type: 'null'}]
+        low:
+          anyOf: [{$ref: '#/components/schemas/Price'}, {type: 'null'}]
+        close:
+          anyOf: [{$ref: '#/components/schemas/Price'}, {type: 'null'}]
+        volume:
+          anyOf: [{$ref: '#/components/schemas/Size'}, {type: 'null'}]
+          description: Contracts or shares traded in the interval.
+        trades: {type: [integer, 'null'], minimum: 0}
+        vwap:
+          anyOf: [{$ref: '#/components/schemas/Price'}, {type: 'null'}]
+          description: Volume-weighted average trade price; null without trades.
+        carried: {type: boolean, description: 'True if nothing happened in this interval, so OHLC repeats the previous close.'}
+    StatsPoint:
+      type: object
+      required: [t, volume, volume_cum, open_interest, spread, depth_1c, depth_5c, liquidity, carried]
+      properties:
+        t: {$ref: '#/components/schemas/Time'}
+        volume: {type: [number, 'null'], description: 'Traded in the interval, in `volume_unit`. Venue-reported figures can occasionally be negative.'}
+        volume_cum: {type: [number, 'null'], minimum: 0, description: 'Traded since the market opened, at the end of the interval, in `volume_unit`.'}
+        open_interest:
+          anyOf: [{$ref: '#/components/schemas/Size'}, {type: 'null'}]
+        spread:
+          anyOf: [{$ref: '#/components/schemas/Price'}, {type: 'null'}]
+          description: Ask − bid; null if a side is empty or the book is crossed.
+        depth_1c:
+          anyOf: [{$ref: '#/components/schemas/Size'}, {type: 'null'}]
+          description: Size within 1¢ of the mid, both sides.
+        depth_5c:
+          anyOf: [{$ref: '#/components/schemas/Size'}, {type: 'null'}]
+          description: Size within 5¢ of the mid, both sides.
+        liquidity: {type: [number, 'null'], description: The venue's own liquidity figure (Polymarket); null on Kalshi.}
+        carried: {type: boolean, description: 'True if nothing changed in this interval, so the values repeat the previous row''s.'}
+    BookSample:
+      type: object
+      required: [t, bids, asks, last_change]
+      properties:
+        t:
+          $ref: '#/components/schemas/Time'
+          description: The interval's start (the book is as of its end); for a book `at` a millisecond, that moment.
+        bids:
+          type: [array, 'null']
+          items: {$ref: '#/components/schemas/PriceLevel'}
+          description: Best (highest) first. Null when there is no data for that time.
+        asks:
+          type: [array, 'null']
+          items: {$ref: '#/components/schemas/PriceLevel'}
+          description: Best (lowest) first. Null when there is no data for that time.
+        last_change:
+          anyOf: [{$ref: '#/components/schemas/Time'}, {type: 'null'}]
+          description: The time of the latest change included in this book.
+    BboRow:
+      type: object
+      required: [ts, seq, bid, bid_size, ask, ask_size]
+      properties:
+        ts: {$ref: '#/components/schemas/Time'}
+        seq: {type: integer, minimum: 0, maximum: 65535, description: 'Orders rows with the same `ts`; `(ts, seq)` is unique within the market.'}
+        bid:
+          anyOf: [{$ref: '#/components/schemas/Price'}, {type: 'null'}]
+        bid_size:
+          anyOf: [{$ref: '#/components/schemas/Size'}, {type: 'null'}]
+        ask:
+          anyOf: [{$ref: '#/components/schemas/Price'}, {type: 'null'}]
+        ask_size:
+          anyOf: [{$ref: '#/components/schemas/Size'}, {type: 'null'}]
+    BookUpdateRow:
+      type: object
+      required: [ts, seq, kind, side, price, size, delta]
+      properties:
+        ts: {$ref: '#/components/schemas/Time'}
+        seq: {type: integer, minimum: 0, maximum: 65535, description: 'Orders changes with the same `ts`, from 1; the rows of one change share it. Snapshot rows have 0: the book before any change at that millisecond.'}
+        kind: {type: string, enum: [snapshot, update], description: '`snapshot`: a level of the book at `start`. `update`: a change.'}
+        side: {type: string, enum: [bid, ask]}
+        price: {$ref: '#/components/schemas/Price'}
+        size:
+          $ref: '#/components/schemas/Size'
+          description: The level's size after the change; 0 means the level was removed.
+        delta: {type: [number, 'null'], description: The change from the previous size; null on snapshot rows.}
+    TradeRow:
+      type: object
+      required: [ts, seq, trade_id, price, size, aggressor, is_block]
+      properties:
+        ts: {$ref: '#/components/schemas/Time'}
+        seq: {type: integer, minimum: 1, maximum: 65535, description: 'Orders the market''s trades with the same `ts`, from 1: execution order, except on Kalshi before 18 October 2026, where trades with the same `ts` keep a fixed order that may not be the order they executed in.'}
+        trade_id: {type: string}
+        price: {$ref: '#/components/schemas/Price'}
+        size: {$ref: '#/components/schemas/Size'}
+        aggressor: {type: string, enum: [buy, sell, unknown], description: Whether the taker bought or sold the requested outcome.}
+        is_block: {type: boolean}
+
+    # ---------- history pages ----------
+    PricesPage:
+      type: object
+      required: [market, outcome, resolution, data, next_cursor]
+      properties:
+        market: {$ref: '#/components/schemas/MarketRef'}
+        outcome: {$ref: '#/components/schemas/Outcome'}
+        resolution: {$ref: '#/components/schemas/Resolution'}
+        data: {type: array, items: {$ref: '#/components/schemas/PricePoint'}}
+        next_cursor: {$ref: '#/components/schemas/NextCursor'}
+        attribution: {$ref: '#/components/schemas/Attribution'}
+        data_type: {$ref: '#/components/schemas/DataType'}
+    CandlesPage:
+      type: object
+      required: [market, outcome, resolution, basis, data, next_cursor]
+      properties:
+        market: {$ref: '#/components/schemas/MarketRef'}
+        outcome: {$ref: '#/components/schemas/Outcome'}
+        resolution: {$ref: '#/components/schemas/Resolution'}
+        basis: {type: string, enum: [mid, trade]}
+        data: {type: array, items: {$ref: '#/components/schemas/Candle'}}
+        next_cursor: {$ref: '#/components/schemas/NextCursor'}
+        attribution: {$ref: '#/components/schemas/Attribution'}
+        data_type: {$ref: '#/components/schemas/DataType'}
+    StatsPage:
+      type: object
+      required: [market, resolution, source, volume_unit, data, next_cursor]
+      properties:
+        market: {$ref: '#/components/schemas/MarketRef'}
+        resolution: {type: string, enum: ['1m', '10m', '1h', '6h', '1d']}
+        source: {type: string, enum: [computed, venue_reported], description: '`computed`: our definitions applied to the venue''s events (open interest as the venue reports it). `venue_reported`: the venue''s own figures.'}
+        volume_unit: {type: string, enum: [contracts, usd]}
+        data: {type: array, items: {$ref: '#/components/schemas/StatsPoint'}}
+        next_cursor: {$ref: '#/components/schemas/NextCursor'}
+        attribution: {$ref: '#/components/schemas/Attribution'}
+        data_type: {$ref: '#/components/schemas/DataType'}
+    BooksPage:
+      type: object
+      required: [market, outcome, interval, depth, data, next_cursor]
+      properties:
+        market: {$ref: '#/components/schemas/MarketRef'}
+        outcome: {$ref: '#/components/schemas/Outcome'}
+        interval:
+          anyOf: [{$ref: '#/components/schemas/Resolution'}, {type: 'null'}]
+          description: Null for a book `at` a millisecond.
+        depth:
+          anyOf:
+            - {type: integer, minimum: 1, maximum: 1000}
+            - {type: string, enum: [all]}
+        data: {type: array, items: {$ref: '#/components/schemas/BookSample'}}
+        next_cursor: {$ref: '#/components/schemas/NextCursor'}
+        attribution: {$ref: '#/components/schemas/Attribution'}
+        data_type: {$ref: '#/components/schemas/DataType'}
+    BboPage:
+      type: object
+      required: [market, outcome, data, next_cursor]
+      properties:
+        market: {$ref: '#/components/schemas/MarketRef'}
+        outcome: {$ref: '#/components/schemas/Outcome'}
+        data: {type: array, items: {$ref: '#/components/schemas/BboRow'}}
+        next_cursor: {$ref: '#/components/schemas/NextCursor'}
+        attribution: {$ref: '#/components/schemas/Attribution'}
+        data_type: {$ref: '#/components/schemas/DataType'}
+    BookUpdatesPage:
+      type: object
+      required: [market, outcome, data, next_cursor]
+      properties:
+        market: {$ref: '#/components/schemas/MarketRef'}
+        outcome: {$ref: '#/components/schemas/Outcome'}
+        data: {type: array, items: {$ref: '#/components/schemas/BookUpdateRow'}}
+        next_cursor: {$ref: '#/components/schemas/NextCursor'}
+        attribution: {$ref: '#/components/schemas/Attribution'}
+        data_type: {$ref: '#/components/schemas/DataType'}
+    TradesPage:
+      type: object
+      required: [market, outcome, data, next_cursor]
+      properties:
+        market: {$ref: '#/components/schemas/MarketRef'}
+        outcome: {$ref: '#/components/schemas/Outcome'}
+        data: {type: array, items: {$ref: '#/components/schemas/TradeRow'}}
+        next_cursor: {$ref: '#/components/schemas/NextCursor'}
+        attribution: {$ref: '#/components/schemas/Attribution'}
+        data_type: {$ref: '#/components/schemas/DataType'}
+
+    # ---------- account ----------
+    Usage:
+      type: object
+      required: [organization, plan, rate_limit, entitlements, quotas]
+      properties:
+        organization:
+          type: object
+          required: [id, name]
+          properties:
+            id: {type: string}
+            name: {type: string}
+        plan:
+          type: object
+          required: [name, title]
+          properties:
+            name: {type: string, examples: [pro]}
+            title: {type: [string, 'null'], examples: [Pro]}
+        rate_limit:
+          type: object
+          required: [units_per_minute, remaining, resets_at]
+          properties:
+            units_per_minute: {type: [integer, 'null'], description: Null means unlimited.}
+            remaining: {type: [integer, 'null']}
+            resets_at: {$ref: '#/components/schemas/Time'}
+        entitlements:
+          type: array
+          items: {$ref: '#/components/schemas/EntitlementGrant'}
+        quotas:
+          type: array
+          items: {$ref: '#/components/schemas/Quota'}
+    EntitlementGrant:
+      type: object
+      required: [venue, entitlement, enabled, reason, max_history_days, min_resolution, datasets]
+      properties:
+        venue: {$ref: '#/components/schemas/Venue'}
+        entitlement: {$ref: '#/components/schemas/Entitlement'}
+        enabled: {type: boolean}
+        reason:
+          type: [string, 'null']
+          enum: [not_in_plan, eligibility_required, suspended, not_yet_available, null]
+          description: Why it is disabled; null when enabled.
+        max_history_days: {type: [integer, 'null'], minimum: 1, description: How far back `start` may go; null means no limit.}
+        min_resolution:
+          anyOf: [{$ref: '#/components/schemas/Resolution'}, {type: 'null'}]
+          description: The finest resolution or interval allowed.
+        datasets:
+          type: [array, 'null']
+          items: {$ref: '#/components/schemas/Dataset'}
+          description: The datasets this grant covers on this venue; null means every dataset of the entitlement.
+    Quota:
+      type: object
+      required: [venue, entitlement, unit, limit, used, period_start, period_end]
+      properties:
+        venue:
+          anyOf: [{$ref: '#/components/schemas/Venue'}, {type: 'null'}]
+          description: Null when the quota covers every venue.
+        entitlement: {$ref: '#/components/schemas/Entitlement'}
+        unit:
+          description: What the quota counts (more may be added).
+          anyOf:
+            - {type: string, enum: [rows]}
+            - {type: string}
+        limit: {type: [integer, 'null'], minimum: 0, description: Null means unlimited.}
+        used: {type: integer, minimum: 0}
+        period_start: {$ref: '#/components/schemas/Time'}
+        period_end: {$ref: '#/components/schemas/Time'}
+    UsageResponse:
+      type: object
+      required: [data]
+      properties:
+        data: {$ref: '#/components/schemas/Usage'}
+    HealthResponse:
+      type: object
+      required: [status, version, time]
+      properties:
+        status: {type: string, enum: [ok, unavailable]}
+        version: {type: string}
+        time: {$ref: '#/components/schemas/Time'}
+
+    # ---------- errors ----------
+    ErrorCode:
+      description: A stable error code (see "Errors" in the introduction). More may be added.
+      anyOf:
+        - type: string
+          enum: [invalid_parameter, invalid_cursor, window_too_large, unauthorized, forbidden_venue, forbidden_dataset, plan_history_limit, plan_resolution_not_allowed, suspended, not_found, not_acceptable, rate_limited, quota_exceeded, internal_error, metadata_refreshing, service_unavailable, timeout]
+        - {type: string}
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message, request_id]
+          properties:
+            code: {$ref: '#/components/schemas/ErrorCode'}
+            message: {type: string, description: For people; may change. Use `code` in programs.}
+            request_id: {type: string}
+            details:
+              type: object
+              additionalProperties: true
+              description: 'Machine-readable specifics: the parameter at fault, the limit, the reason, when a quota resets.'

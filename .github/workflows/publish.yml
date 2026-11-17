@@ -1,0 +1,125 @@
+name: publish
+
+# Uploads the qelso package to PyPI, by hand only: Actions → publish → Run workflow on main, with the version in
+# src/qelso/_version.py (or `gh workflow run publish.yml --ref main -f version=<version>`). The upload waits in
+# the `pypi` environment until its required reviewer approves it. PyPI trusts this workflow and environment by
+# OIDC (trusted publishing), so no token is stored anywhere, and the upload carries PyPI attestations naming
+# this repository. PyPI never accepts the same version twice.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "The version to publish: exactly src/qelso/_version.py's, normalized (e.g. 0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+      - name: from main only
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::publish runs from main only, not ${GITHUB_REF}"
+          exit 1
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
+        with:
+          version: "0.12.13"
+          enable-cache: false
+      - run: uv python install 3.12
+      - run: uv sync --locked --python 3.12
+      - name: the input is the package's version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          actual="$(uv run python -c 'import qelso; print(qelso.__version__)')"
+          if [ "$actual" != "$VERSION" ]; then
+            echo "::error::the input is ${VERSION}, but src/qelso/_version.py says ${actual}"
+            exit 1
+          fi
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv run mypy
+      - name: the generated code follows the contract
+        run: uv run python scripts/generate.py --check
+      - run: uv run pytest -q
+
+  # After test, so nothing a test dependency runs can be on the runner while the files are made; publish checks
+  # the files' SHA-256 against what this job made before it uploads them.
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      sums: ${{ steps.sums.outputs.sums }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262  # v4.4.0
+        with:
+          persist-credentials: false
+      - name: from main only
+        if: github.ref != 'refs/heads/main'
+        run: |
+          echo "::error::publish runs from main only, not ${GITHUB_REF}"
+          exit 1
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e  # v6.8.0
+        with:
+          version: "0.12.13"
+          enable-cache: false
+      - run: uv build --python 3.12
+      - name: the built files carry that version, and nothing else is there
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          ls -l dist
+          test -f "dist/qelso-${VERSION}-py3-none-any.whl"
+          test -f "dist/qelso-${VERSION}.tar.gz"
+          test "$(ls dist | wc -l)" -eq 2
+      - id: sums
+        name: the files' SHA-256, for publish to check
+        run: echo "sums=$(cd dist && sha256sum * | sort | sha256sum | cut -c1-64)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: [test, build]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: pypi
+      url: https://pypi.org/project/qelso/${{ inputs.version }}/
+    permissions:
+      id-token: write  # PyPI's trusted publishing; this job runs no code of ours
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          name: dist
+          path: dist/
+      - name: the files are the ones build made
+        env:
+          SUMS: ${{ needs.build.outputs.sums }}
+        run: |
+          actual="$(cd dist && sha256sum * | sort | sha256sum | cut -c1-64)"
+          if [ "$actual" != "$SUMS" ]; then
+            echo "::error::dist/ differs from what build made (${actual} vs ${SUMS})"
+            exit 1
+          fi
+      - name: upload to PyPI
+        # v1.14.3: earlier versions trust a revoked CA (GHSA-5xjx-3w67-w9x9). Check for advisories before a release.
+        uses: pypa/gh-action-pypi-publish@7245906fb61fa33a13554f9d5fb856fe61758086  # v1.14.3
+        with:
+          packages-dir: dist/
